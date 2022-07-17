@@ -1,0 +1,271 @@
+-- Vytvoření první tabulky
+
+create table if not exists t_tereza_sebestova_project_SQL_primary_final as 
+	select * from 
+		(with base as 
+		(
+	select
+		distinct 
+			cp.payroll_year as year,
+			cpvt.name as value_type, 
+			coalesce(cpib.name, 'ČR') as name,
+			ROUND(AVG(value) over (partition by year, cp.industry_branch_code order by cp.industry_branch_code), 2) as average,
+			cpu.name as unit
+	from
+		czechia_payroll cp
+	join czechia_payroll_calculation cpc 
+				on
+		cp.calculation_code = cpc.code
+	left join czechia_payroll_industry_branch cpib 
+				on
+		cp.industry_branch_code = cpib.code
+	join czechia_payroll_unit cpu 
+				on
+		cp.unit_code = cpu.code
+	join czechia_payroll_value_type cpvt 
+				on
+		cp.value_type_code = cpvt.code
+	where
+		cp.value_type_code = 5958
+		and cp.calculation_code = 200
+		and cp.payroll_year between 2006 and 2018
+	order by
+		cp.industry_branch_code,
+		cp.payroll_year)
+		
+		select
+				*,
+				round(average - LAG(average) over (partition by name order by year),2) as abs_diff,
+				round((average - LAG(average) over (partition by name order by year)) * 100 / LAG(average) over 											(partition by name order by year),2) as pct_diff
+			from
+		base) as a
+		
+	 union all
+	 
+	select * from 
+		(with base as 
+		(
+	select
+		distinct
+			year (date_from) as year,
+			'Komodita' as value_type,
+			cpc.name as name,
+			round(AVG(value) over (partition by year (date_from), cp.category_code order by cp.category_code), 2) as average,
+			cpc.price_unit as unit
+	from
+		czechia_price cp
+	join czechia_price_category cpc 
+				 on
+		cp.category_code = cpc.code
+	where
+		cp.region_code is null
+		)
+			select
+				*,
+				round(average - LAG(average) over (partition by name order by year),2) as abs_diff,
+				round((average - LAG(average) over (partition by name order by year)) * 100 / LAG(average) over 											(partition by name order by year),2) as pct_diff
+			from
+		base) as b
+	;
+
+/*Jako dodatečný materiál připravte i tabulku s HDP, GINI koeficientem a populací dalších 
+ * evropských států ve stejném období, jako primární přehled pro ČR.*/
+
+create table if not exists t_tereza_sebestova_project_SQL_secondary_final as
+select
+	e.country,
+	e.year,
+	e.GDP,
+	round((GDP - LAG(GDP) over (partition by e.country order by e.year)) * 100 / LAG(GDP) over (partition by e.country order by e.year), 2) as 				pct_diff_GDP,
+	e.gini,
+	c.continent
+from
+	economies e
+left join countries c 
+on
+	e.country = c.country
+where
+	year between 2006 and 2018
+	and continent = 'Europe'
+order by
+	e.country,
+	e.year;
+
+
+/*1. Rostou v průběhu let mzdy ve všech odvětvích, nebo v některých klesají?*/
+select distinct name
+from t_tereza_sebestova_project_SQL_primary_final
+where value_type = 'Průměrná hrubá mzda na zaměstnance'
+and abs_diff < 0
+and name <> 'ČR';
+
+-- v 16 odvětvích nelze pozorovat stálý růst mezd, alespoň jednou průměrná mzda meziročně klesla
+
+/*2. Kolik je možné si koupit litrů mléka a kilogramů chleba za 
+ * první a poslední srovnatelné období v dostupných datech cen a mezd?*/
+select
+	ceny.year,
+	ceny.name,
+	ceny.average as price,
+	mzdy.average as mzda,
+	concat(round(mzdy.average/ceny.average,2) , ' ', ceny.unit) as kolik_koupim
+from
+	(
+	select
+		*
+	from
+		t_tereza_sebestova_project_SQL_primary_final
+	where
+		value_type = 'Komodita'
+		and name in ('Mléko polotučné pasterované', 'Chléb konzumní kmínový')
+		and (year in (
+			select
+				max(year)
+			from
+				t_tereza_sebestova_project_SQL_primary_final)
+		or year in (
+			select
+				min(year)
+			from
+				t_tereza_sebestova_project_SQL_primary_final))) ceny
+	join
+	(
+		select
+			*
+		from
+			t_tereza_sebestova_project_SQL_primary_final
+		where
+			(year in (
+			select
+				max(year)
+			from
+				t_tereza_sebestova_project_SQL_primary_final)
+			or year in (
+			select
+				min(year)
+			from
+				t_tereza_sebestova_project_SQL_primary_final))
+			and name = 'ČR') mzdy
+on
+		ceny.year = mzdy.year;
+	
+-- v roce 2006 lze nakoupit 1211,91 kg chleba a 1352,91 l mléka
+-- v roce 2018 lze nakoupit 1321,91 kg chleba a 1616,70 l mléka	
+	
+/*3. Která kategorie potravin zdražuje nejpomaleji 
+ * (je u ní nejnižší percentuální meziroční nárůst)?*/
+
+with base as
+(
+select
+	*,
+	sum(pct_diff) over (partition by name /*order by year*/
+	) as sum_pct_diff
+from
+	t_tereza_sebestova_project_SQL_primary_final
+where
+	value_type = 'Komodita'
+order by
+	name,
+	year)
+
+select
+	*
+from
+	base
+order by sum_pct_diff asc
+limit 1;
+
+
+-- nejnižší percentuální meziroční nárůst má Cukr krystalový
+
+/*4. Existuje rok, ve kterém byl meziroční nárůst cen potravin 
+ * výrazně vyšší než růst mezd (větší než 10 %)?*/
+select
+	mzdy.year,
+	mzdy.value_type,
+	mzdy.name,
+	mzdy.average,
+	mzdy.unit,
+	mzdy.pct_diff as avg_pct_diff_wages,
+	ceny.avg_pct_diff_price,
+	(ceny.avg_pct_diff_price - mzdy.pct_diff) as diff
+	
+from
+	(
+	select
+		*
+	from
+		t_tereza_sebestova_project_SQL_primary_final
+	where
+		name = 'ČR') mzdy
+join 
+(
+	select
+		distinct
+		year,
+		round(avg(pct_diff) over (partition by year),2) as avg_pct_diff_price
+	from
+		t_tereza_sebestova_project_SQL_primary_final
+	where
+		value_type = 'Komodita'
+	order by
+		avg_pct_diff_price desc) ceny
+on
+	mzdy.year = ceny.year
+order by diff desc;
+
+-- takový rok jsem v datech nenašla, nejvyšší rozdíl mezi růstem cen a mezd byl v roce 2013, kdy mzdy klesly o 0,13 % a ceny vzrostly o 6,01 %
+
+/* 5. Má výška HDP vliv na změny ve mzdách a cenách potravin? 
+ * Neboli, pokud HDP vzroste výrazněji v jednom roce, 
+ * projeví se to na cenách potravin či mzdách ve stejném nebo násdujícím roce výraznějším růstem?*/
+
+with base as (
+select
+	mzdy.year,
+	mzdy.value_type,
+	mzdy.name,
+	mzdy.average,
+	mzdy.unit,
+	mzdy.pct_diff as avg_pct_diff_wages,
+	ceny.avg_pct_diff_price
+from
+	(
+	select
+		*
+	from
+		t_tereza_sebestova_project_SQL_primary_final
+	where
+		name = 'ČR') mzdy
+join 
+(
+	select
+		distinct
+		year,
+		round(avg(pct_diff) over (partition by year),2) as avg_pct_diff_price
+	from
+		t_tereza_sebestova_project_SQL_primary_final
+	where
+		value_type = 'Komodita'
+	order by
+		avg_pct_diff_price desc) ceny
+on
+	mzdy.year = ceny.year
+order by
+	year asc)
+
+select
+	base.year,
+	base.avg_pct_diff_wages,
+	base.avg_pct_diff_price,
+	t_tereza_sebestova_project_SQL_secondary_final.pct_diff_GDP as avg_pct_diff_GDP
+from
+	base
+left join t_tereza_sebestova_project_SQL_secondary_final 
+on
+	base.year = t_tereza_sebestova_project_SQL_secondary_final.year
+where
+	t_tereza_sebestova_project_SQL_secondary_final.country = 'Czech republic';	
+
+-- v dostupných datech nelze jednoznačně určit, zdali má výška HDP vliv na změny ve mzdách a cenách potravin. Tabulka ukazuje meziroční růst mezd, meziroční růst cen potravin a meziroční růst HDP - nelze však říci, že vždy platí vztah, že pokud roste HDP, rostou i mzdy a ceny. Např. V roce 2009 (světová finanční krize) vidíme, že ceny klesají, klesá i HDP, ale průměrné mzdy oproti roku 2008 stále rostou. Naopak rok 2013, další rok recese, ukazuje, že mzdy klesají, klesá i HDP ale ceny rostou. Z dat vidíme, že mezi ukazateli je pravděpodobně nějaká korelace, nikoliv však kauzalita - tedy nelze jednoznačně říci, že pokud HDP vzroste výrazněji v jednom roce, projeví se to na cenách potravin či mzdách ve stejném nebo násdujícím roce výraznějším růstem
